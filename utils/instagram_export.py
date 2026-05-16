@@ -55,6 +55,77 @@ def _download_binary(
     return True
 
 
+def _post_timestamp(post: dict[str, Any]) -> int:
+    try:
+        return int(post.get("taken_at_timestamp") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ordered_posts(posts: list[Any]) -> list[dict[str, Any]]:
+    valid: list[dict[str, Any]] = []
+    for post in posts:
+        if isinstance(post, dict):
+            valid.append(post)
+    if not valid:
+        return []
+
+    def sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int]:
+        idx, post = item
+        pos = post.get("position")
+        try:
+            pos_i = int(pos) if pos is not None else 0
+        except (TypeError, ValueError):
+            pos_i = 0
+        if pos_i > 0:
+            return (0, pos_i)
+        return (1, idx)
+
+    indexed = list(enumerate(valid))
+    indexed.sort(key=sort_key)
+    ordered = [post for _, post in indexed]
+
+    prev_ts = None
+    monotonic = True
+    for post in ordered:
+        ts = _post_timestamp(post)
+        if ts and prev_ts is not None and ts > prev_ts:
+            monotonic = False
+            break
+        if ts:
+            prev_ts = ts
+    if monotonic:
+        return ordered
+
+    indexed2 = list(enumerate(ordered))
+    indexed2.sort(key=lambda pair: (-_post_timestamp(pair[1]), pair[0]))
+    return [post for _, post in indexed2]
+
+
+def _post_folder_name(position: int, shortcode: str) -> str:
+    sc = _sanitize_dir(shortcode) or f"post_{position:04d}"
+    return f"{position:04d}_{sc}"
+
+
+def _resolve_post_dir(posts_root: Path, position: int, shortcode: str) -> Path:
+    numbered = posts_root / _post_folder_name(position, shortcode)
+    if numbered.exists():
+        return numbered
+    legacy = posts_root / _sanitize_dir(shortcode)
+    if legacy.exists():
+        return legacy
+    if shortcode:
+        suffix = f"_{_sanitize_dir(shortcode)}"
+        matches = sorted(
+            p
+            for p in posts_root.iterdir()
+            if p.is_dir() and (p.name == shortcode or p.name.endswith(suffix))
+        )
+        if matches:
+            return matches[0]
+    return numbered
+
+
 def _post_media_items(post: dict[str, Any]) -> list[dict[str, Any]]:
     items = post.get("media_items")
     if isinstance(items, list) and items:
@@ -176,8 +247,16 @@ def export_instagram_to_folders(
         total = 1
     counter = [0]
 
+    export_data = dict(data)
+    raw_for_save = export_data.get("posts") or []
+    if isinstance(raw_for_save, list) and raw_for_save:
+        ordered_save = _ordered_posts(raw_for_save)
+        for pos, post in enumerate(ordered_save, start=1):
+            post["position"] = pos
+        export_data["posts"] = ordered_save
+
     (root / "scraped_data.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
+        json.dumps(export_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     _tick(progress_callback, counter, total, root)
@@ -220,19 +299,47 @@ def export_instagram_to_folders(
     posts_root = root / "posts"
     posts_root.mkdir(exist_ok=True)
 
-    posts = data.get("posts") or []
-    if not isinstance(posts, list):
-        posts = []
+    raw_posts = data.get("posts") or []
+    if not isinstance(raw_posts, list):
+        raw_posts = []
+    posts = _ordered_posts(raw_posts)
 
-    for idx, post in enumerate(posts):
-        if not isinstance(post, dict):
-            continue
-        sc = (post.get("shortcode") or "").strip() or f"post_{idx:04d}"
-        post_folder = _sanitize_dir(sc)
-        pdir = posts_root / post_folder
+    posts_index: list[dict[str, Any]] = []
+    for position, post in enumerate(posts, start=1):
+        sc = (post.get("shortcode") or "").strip() or f"post_{position:04d}"
+        posts_index.append(
+            {
+                "position": position,
+                "shortcode": sc,
+                "taken_at_timestamp": post.get("taken_at_timestamp"),
+                "folder": _post_folder_name(position, sc),
+                "url": post.get("url") or "",
+            }
+        )
+    (posts_root / "posts_index.json").write_text(
+        json.dumps(posts_index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    for position, post in enumerate(posts, start=1):
+        sc = (post.get("shortcode") or "").strip() or f"post_{position:04d}"
+        pdir = _resolve_post_dir(posts_root, position, sc)
         pdir.mkdir(exist_ok=True)
 
         referer = (post.get("url") or "").strip() or f"https://www.instagram.com/{username}/"
+        (pdir / "post_meta.json").write_text(
+            json.dumps(
+                {
+                    "position": position,
+                    "shortcode": sc,
+                    "taken_at_timestamp": post.get("taken_at_timestamp"),
+                    "url": referer,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         (pdir / "caption.txt").write_text(post.get("caption") or "", encoding="utf-8")
         _tick(progress_callback, counter, total, root)
 

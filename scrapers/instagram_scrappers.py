@@ -7,7 +7,10 @@ from typing import Any, Optional, Tuple
 from bs4 import BeautifulSoup
 
 _MAX_POSTS = 200
-_TIMELINE_PAGE_SIZE = 12
+_TIMELINE_PAGE_SIZE = 50
+_TIMELINE_QUERY_HASH = "58b6785bea111c67129decbe6a448951"
+_TIMELINE_DOC_ID = "7950326061742207"
+_TIMELINE_EMPTY_PAGE_RETRIES = 2
 _HIGHLIGHTS_QUERY_ID = "9957820854288654"
 _HIGHLIGHT_ITEMS_BATCH_SIZE = 5
 _HIGHLIGHT_ITEMS_MAX_RETRIES = 3
@@ -207,12 +210,71 @@ def _profile_from_api_user(user: dict, username: str) -> dict:
     return out
 
 
+def _edge_shortcode(edge: dict[str, Any]) -> str:
+    if not isinstance(edge, dict):
+        return ""
+    node = edge.get("node") or {}
+    if not isinstance(node, dict):
+        return ""
+    return str(node.get("shortcode") or "").strip()
+
+
+def _edge_taken_at(edge: dict[str, Any]) -> int:
+    if not isinstance(edge, dict):
+        return 0
+    node = edge.get("node") or {}
+    if not isinstance(node, dict):
+        return 0
+    try:
+        return int(node.get("taken_at_timestamp") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dedupe_timeline_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        sc = _edge_shortcode(edge)
+        if sc:
+            if sc in seen:
+                continue
+            seen.add(sc)
+        out.append(edge)
+    return out
+
+
+def _sort_timeline_edges_newest_first(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    indexed = list(enumerate(edges))
+    indexed.sort(
+        key=lambda pair: (-_edge_taken_at(pair[1]), pair[0]),
+    )
+    return [edge for _, edge in indexed]
+
+
+def _timeline_order_ok(edges: list[dict[str, Any]]) -> bool:
+    prev = None
+    for edge in edges:
+        ts = _edge_taken_at(edge)
+        if prev is not None and ts > prev:
+            return False
+        if ts:
+            prev = ts
+    return True
+
+
 def _media_items_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
     child_edges = (node.get("edge_sidecar_to_children") or {}).get("edges") or []
     if child_edges:
         items: list[dict[str, Any]] = []
         for ce in child_edges:
+            if not isinstance(ce, dict):
+                continue
             n = ce.get("node") or {}
+            if not isinstance(n, dict):
+                continue
             items.append(
                 {
                     "display_url": n.get("display_url") or "",
@@ -259,7 +321,15 @@ def _post_from_timeline_node(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _graphql_timeline_page(
+def _parse_timeline_media(body: dict[str, Any]) -> Optional[dict[str, Any]]:
+    user = (body.get("data") or {}).get("user") or {}
+    timeline = user.get("edge_owner_to_timeline_media")
+    if isinstance(timeline, dict) and isinstance(timeline.get("edges"), list):
+        return timeline
+    return None
+
+
+def _graphql_timeline_page_doc_id(
     session,
     use_curl: bool,
     username: str,
@@ -269,22 +339,13 @@ def _graphql_timeline_page(
 ) -> Optional[dict[str, Any]]:
     variables: dict[str, Any] = {
         "id": user_id,
-        "data": {
-            "count": _TIMELINE_PAGE_SIZE,
-            "include_relationship_info": True,
-            "latest_besties_reel_media": True,
-            "latest_reel_media": True,
-        },
-        "__relay_internal__pv__PolarisFeedShareMenurelayprovider": False,
-        "before": None,
         "first": _TIMELINE_PAGE_SIZE,
-        "last": None,
     }
     if after:
         variables["after"] = after
     payload = {
         "variables": json.dumps(variables, separators=(",", ":")),
-        "doc_id": "7950326061742207",
+        "doc_id": _TIMELINE_DOC_ID,
         "server_timestamps": "true",
     }
     h = _api_headers(username, csrf)
@@ -304,7 +365,137 @@ def _graphql_timeline_page(
         return None
     if body.get("status") != "ok":
         return None
-    return (body.get("data") or {}).get("user", {}).get("edge_owner_to_timeline_media")
+    return _parse_timeline_media(body)
+
+
+def _graphql_timeline_page_query_hash(
+    session,
+    use_curl: bool,
+    username: str,
+    user_id: str,
+    after: Optional[str],
+    csrf: str,
+) -> Optional[dict[str, Any]]:
+    variables: dict[str, Any] = {
+        "id": user_id,
+        "first": _TIMELINE_PAGE_SIZE,
+        "after": after,
+    }
+    params = {
+        "query_hash": _TIMELINE_QUERY_HASH,
+        "variables": json.dumps(variables, separators=(",", ":")),
+    }
+    url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
+    resp = _session_get(session, use_curl, url, _api_headers(username, csrf))
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except json.JSONDecodeError:
+        return None
+    return _parse_timeline_media(body)
+
+
+def _graphql_timeline_page(
+    session,
+    use_curl: bool,
+    username: str,
+    user_id: str,
+    after: Optional[str],
+    csrf: str,
+) -> Optional[dict[str, Any]]:
+    page = _graphql_timeline_page_doc_id(
+        session, use_curl, username, user_id, after, csrf
+    )
+    if page and page.get("edges"):
+        return page
+    return _graphql_timeline_page_query_hash(
+        session, use_curl, username, user_id, after, csrf
+    )
+
+
+def _collect_timeline_edges(
+    session,
+    use_curl: bool,
+    username: str,
+    user_id: str,
+    timeline: Optional[dict[str, Any]],
+    target_count: int,
+    csrf: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    page_info: dict[str, Any] = {}
+    if timeline and isinstance(timeline.get("edges"), list):
+        edges.extend(timeline["edges"])
+        page_info = timeline.get("page_info") or {}
+
+    edges = _dedupe_timeline_edges(edges)
+    max_pages = max(
+        5,
+        (target_count + _TIMELINE_PAGE_SIZE - 1) // _TIMELINE_PAGE_SIZE + 5,
+    )
+    pages_fetched = 1
+    last_cursor: Optional[str] = None
+    stagnant_pages = 0
+
+    while len(edges) < target_count and page_info.get("has_next_page") and user_id:
+        if pages_fetched >= max_pages:
+            break
+        cursor = page_info.get("end_cursor")
+        if not cursor:
+            break
+        if cursor == last_cursor:
+            break
+        last_cursor = cursor
+
+        time.sleep(0.45)
+        next_page = None
+        for attempt in range(_TIMELINE_EMPTY_PAGE_RETRIES):
+            if attempt:
+                time.sleep(0.65 * attempt)
+            next_page = _graphql_timeline_page(
+                session, use_curl, username, user_id, cursor, csrf
+            )
+            if next_page and isinstance(next_page.get("edges"), list):
+                if next_page["edges"]:
+                    break
+        pages_fetched += 1
+        if not next_page or not isinstance(next_page.get("edges"), list):
+            break
+
+        new_edges = next_page["edges"]
+        if not new_edges:
+            stagnant_pages += 1
+            if stagnant_pages >= 2:
+                break
+            continue
+        stagnant_pages = 0
+
+        before = len(edges)
+        edges.extend(new_edges)
+        edges = _dedupe_timeline_edges(edges)
+        if len(edges) == before:
+            stagnant_pages += 1
+            if stagnant_pages >= 2:
+                break
+        else:
+            stagnant_pages = 0
+
+        page_info = next_page.get("page_info") or {}
+        if not csrf:
+            csrf = _csrf_token(session)
+
+    order_corrected = False
+    if not _timeline_order_ok(edges):
+        edges = _sort_timeline_edges_newest_first(edges)
+        order_corrected = True
+
+    meta = {
+        "pages_fetched": pages_fetched,
+        "edges_collected": len(edges),
+        "order_corrected": order_corrected,
+    }
+    return edges[:target_count], meta
 
 
 def _highlight_reel_id(raw_id: Any) -> str:
@@ -769,35 +960,16 @@ def scrape_instagram_profile(
 
     profile["posts"] = []
 
-    edges: list[dict[str, Any]] = []
-    page_info: dict[str, Any] = {}
-    if timeline and isinstance(timeline.get("edges"), list):
-        edges.extend(timeline["edges"])
-        page_info = timeline.get("page_info") or {}
-
-    max_pages = (recent_posts + _TIMELINE_PAGE_SIZE - 1) // _TIMELINE_PAGE_SIZE + 3
-    pages_fetched = 1
-
-    while len(edges) < recent_posts and page_info.get("has_next_page") and user_id:
-        if pages_fetched >= max_pages:
-            break
-        time.sleep(0.45)
-        cursor = page_info.get("end_cursor")
-        if not cursor:
-            break
-        next_page = _graphql_timeline_page(
-            session, use_curl, username, user_id, cursor, csrf
-        )
-        pages_fetched += 1
-        if not next_page or not isinstance(next_page.get("edges"), list):
-            break
-        new_edges = next_page["edges"]
-        if not new_edges:
-            break
-        edges.extend(new_edges)
-        page_info = next_page.get("page_info") or {}
-        if not csrf:
-            csrf = _csrf_token(session)
+    edges, fetch_meta = _collect_timeline_edges(
+        session,
+        use_curl,
+        username,
+        user_id or "",
+        timeline,
+        recent_posts,
+        csrf,
+    )
+    profile["posts_fetch"] = fetch_meta
 
     if not edges:
         profile["posts_note"] = (
@@ -811,10 +983,12 @@ def scrape_instagram_profile(
             "Private accounts, rate limits, or API changes can limit results."
         )
 
-    for edge in edges[:recent_posts]:
+    for pos, edge in enumerate(edges[:recent_posts], start=1):
         node = edge.get("node") if isinstance(edge, dict) else None
         if not node:
             continue
-        profile["posts"].append(_post_from_timeline_node(node))
+        post = _post_from_timeline_node(node)
+        post["position"] = pos
+        profile["posts"].append(post)
 
     return profile
