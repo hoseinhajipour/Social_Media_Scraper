@@ -7,7 +7,6 @@ from scrapers.github_scrappers import scrape_github_profile
 from scrapers.instagram_scrappers import scrape_instagram_profile
 from scrapers.twitter_scrapper import scrape_twitter_profile
 from utils.exporter import save_to_csv
-import json
 
 
 OUTPUT_DIR = "output"
@@ -24,6 +23,22 @@ def main():
     parser=argparse.ArgumentParser(description="Social Media Profile Scraper CLI")
     parser.add_argument("platform", choices=SCRAPER_MAP.keys(), help="Platform to scrape")
     parser.add_argument("username", help="Username to scrape")
+    parser.add_argument(
+        "--recent-posts",
+        type=int,
+        default=0,
+        help="Instagram only: how many recent posts to include (0 = profile only, max 200)",
+    )
+    parser.add_argument(
+        "--highlights",
+        action="store_true",
+        help="Instagram only: also scrape story highlights",
+    )
+    parser.add_argument(
+        "--instagram-sessionid",
+        default="",
+        help="Instagram sessionid cookie (or set INSTAGRAM_SESSIONID) for highlight media",
+    )
 
     args = parser.parse_args()
     platform = args.platform
@@ -33,7 +48,17 @@ def main():
     scraper_func = SCRAPER_MAP[platform]
 
     try:
-        data = scraper_func(username)
+        if platform == "instagram":
+            data = scrape_instagram_profile(
+                username,
+                recent_posts=args.recent_posts,
+                include_highlights=args.highlights,
+                instagram_sessionid=args.instagram_sessionid or None,
+            )
+        else:
+            if args.recent_posts or args.highlights:
+                print("Note: --recent-posts and --highlights are ignored outside instagram.")
+            data = scraper_func(username)
         print(json.dumps(data, indent=4))
 
         file_path = os.path.join(OUTPUT_DIR, f"{username}_{platform}.json")
