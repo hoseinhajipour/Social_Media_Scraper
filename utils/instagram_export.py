@@ -24,7 +24,12 @@ def _should_skip_file(path: Path, resume: bool) -> bool:
 
 
 def _download_binary(
-    url: str, dest: Path, referer: str, resume: bool = True
+    url: str,
+    dest: Path,
+    referer: str,
+    resume: bool = True,
+    use_system_proxy: bool = False,
+    proxy_url: Optional[str] = None,
 ) -> bool:
     if not url or not url.startswith("http"):
         return False
@@ -41,14 +46,28 @@ def _download_binary(
     try:
         from curl_cffi import requests as curl_requests
 
-        r = curl_requests.get(
-            url, headers=headers, impersonate="chrome131", timeout=120
+        session = curl_requests.Session(
+            proxy=proxy_url,
+            trust_env=use_system_proxy,
+        )
+        r = session.get(
+            url,
+            headers=headers,
+            impersonate="chrome131",
+            timeout=120,
         )
     except ImportError:
         import requests
 
-        r = requests.get(url, headers=headers, timeout=120)
-    if r.status_code != 200:
+        session = requests.Session()
+        session.trust_env = use_system_proxy
+        if proxy_url:
+            session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url,
+            }
+        r = session.get(url, headers=headers, timeout=120)
+    if getattr(r, "status_code", None) != 200:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(r.content)
@@ -228,6 +247,8 @@ def export_instagram_to_folders(
     progress_callback: ProgressFn = None,
     resume: bool = True,
     download_highlights: bool = True,
+    use_system_proxy: bool = False,
+    proxy_url: Optional[str] = None,
 ) -> Path:
     if not isinstance(data, dict) or data.get("error"):
         raise ValueError("Invalid Instagram data or error field present")
@@ -273,6 +294,8 @@ def export_instagram_to_folders(
                 dest_pic,
                 f"https://www.instagram.com/{username}/",
                 resume=False,
+                use_system_proxy=use_system_proxy,
+                proxy_url=proxy_url,
             )
             if not ok:
                 (profile_dir / "profile_pic_download_failed.txt").write_text(
@@ -346,7 +369,14 @@ def export_instagram_to_folders(
         items = _post_media_items(post)
         cover_src = (items[0].get("display_url") or post.get("display_url") or "").strip()
         if cover_src:
-            _download_binary(cover_src, pdir / "cover.jpg", referer, resume=resume)
+            _download_binary(
+                cover_src,
+                pdir / "cover.jpg",
+                referer,
+                resume=resume,
+                use_system_proxy=use_system_proxy,
+                proxy_url=proxy_url,
+            )
         _tick(progress_callback, counter, total, root)
 
         media_dir = pdir / "media"
@@ -364,7 +394,14 @@ def export_instagram_to_folders(
                 continue
             ext = ".mp4" if is_vid else ".jpg"
             fname = f"{mi + 1:03d}{ext}"
-            _download_binary(media_url, media_dir / fname, referer, resume=resume)
+            _download_binary(
+                media_url,
+                media_dir / fname,
+                referer,
+                resume=resume,
+                use_system_proxy=use_system_proxy,
+                proxy_url=proxy_url,
+            )
             _tick(progress_callback, counter, total, root)
             time.sleep(0.15)
 
@@ -394,7 +431,12 @@ def export_instagram_to_folders(
                 cover_url = (hl.get("cover_url") or "").strip()
                 if cover_url:
                     _download_binary(
-                        cover_url, hdir / "cover_icon.png", referer, resume=resume
+                        cover_url,
+                        hdir / "cover_icon.png",
+                        referer,
+                        resume=resume,
+                        use_system_proxy=use_system_proxy,
+                        proxy_url=proxy_url,
                     )
                 _tick(progress_callback, counter, total, root)
 
@@ -411,7 +453,14 @@ def export_instagram_to_folders(
                         continue
                     ext = ".mp4" if is_vid else ".jpg"
                     fname = f"{mi + 1:03d}{ext}"
-                    _download_binary(media_url, media_dir / fname, referer, resume=resume)
+                    _download_binary(
+                        media_url,
+                        media_dir / fname,
+                        referer,
+                        resume=resume,
+                        use_system_proxy=use_system_proxy,
+                        proxy_url=proxy_url,
+                    )
                     _tick(progress_callback, counter, total, root)
                     time.sleep(0.15)
                 time.sleep(0.2)

@@ -10,7 +10,9 @@ _MAX_POSTS = 200
 _TIMELINE_PAGE_SIZE = 50
 _TIMELINE_QUERY_HASH = "58b6785bea111c67129decbe6a448951"
 _TIMELINE_DOC_ID = "7950326061742207"
-_TIMELINE_EMPTY_PAGE_RETRIES = 2
+_TIMELINE_EMPTY_PAGE_RETRIES = 3
+_FEED_V1_PAGE_SIZE = 33
+_FEED_V1_MAX_PAGES = 25
 _HIGHLIGHTS_QUERY_ID = "9957820854288654"
 _HIGHLIGHT_ITEMS_BATCH_SIZE = 5
 _HIGHLIGHT_ITEMS_MAX_RETRIES = 3
@@ -64,12 +66,19 @@ def _apply_instagram_session_cookie(session, sessionid: str) -> None:
             pass
 
 
-def _new_session(sessionid: Optional[str] = None) -> Tuple[Any, bool]:
+def _new_session(
+    sessionid: Optional[str] = None,
+    use_system_proxy: bool = False,
+    proxy_url: Optional[str] = None,
+) -> Tuple[Any, bool]:
     use_curl = False
     try:
         from curl_cffi import requests as curl_requests
 
-        session = curl_requests.Session()
+        session = curl_requests.Session(
+            proxy=proxy_url,
+            trust_env=use_system_proxy,
+        )
         use_curl = True
     except ImportError:
         import requests
@@ -77,6 +86,12 @@ def _new_session(sessionid: Optional[str] = None) -> Tuple[Any, bool]:
         from urllib3.util.retry import Retry
 
         session = requests.Session()
+        session.trust_env = use_system_proxy
+        if proxy_url:
+            session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url,
+            }
         retries = Retry(
             total=3,
             backoff_factor=0.6,
@@ -404,14 +419,154 @@ def _graphql_timeline_page(
     after: Optional[str],
     csrf: str,
 ) -> Optional[dict[str, Any]]:
-    page = _graphql_timeline_page_doc_id(
+    page = _graphql_timeline_page_query_hash(
         session, use_curl, username, user_id, after, csrf
     )
     if page and page.get("edges"):
         return page
-    return _graphql_timeline_page_query_hash(
+    return _graphql_timeline_page_doc_id(
         session, use_curl, username, user_id, after, csrf
     )
+
+
+def _feed_image_url(item: dict[str, Any]) -> str:
+    candidates = (item.get("image_versions2") or {}).get("candidates") or []
+    if candidates and isinstance(candidates[0], dict):
+        return (candidates[0].get("url") or "").strip()
+    return (item.get("thumbnail_url") or item.get("display_url") or "").strip()
+
+
+def _feed_video_url(item: dict[str, Any]) -> str:
+    versions = item.get("video_versions") or []
+    if versions and isinstance(versions[0], dict):
+        return (versions[0].get("url") or "").strip()
+    return ""
+
+
+def _caption_text_from_feed_item(item: dict[str, Any]) -> str:
+    caption = item.get("caption")
+    if isinstance(caption, dict):
+        return (caption.get("text") or "").strip()
+    if isinstance(caption, str):
+        return caption.strip()
+    return ""
+
+
+def _node_from_feed_item(item: dict[str, Any], *, nested: bool = False) -> dict[str, Any]:
+    shortcode = (item.get("code") or "").strip()
+    media_type = item.get("media_type")
+    is_video = bool(media_type == 2 or item.get("video_versions"))
+    video_url = _feed_video_url(item) if is_video else ""
+    display_url = _feed_image_url(item)
+    if is_video and not display_url:
+        display_url = video_url
+
+    caption_text = _caption_text_from_feed_item(item)
+    caption_edges = (
+        [{"node": {"text": caption_text}}] if caption_text else []
+    )
+
+    node: dict[str, Any] = {
+        "shortcode": shortcode,
+        "taken_at_timestamp": item.get("taken_at") or item.get("device_timestamp"),
+        "is_video": is_video,
+        "edge_liked_by": {"count": item.get("like_count")},
+        "edge_media_to_comment": {"count": item.get("comment_count")},
+        "edge_media_to_caption": {"edges": caption_edges},
+        "display_url": display_url,
+        "video_url": video_url,
+        "product_type": item.get("product_type") or "",
+    }
+
+    if not nested and media_type == 8:
+        child_edges: list[dict[str, Any]] = []
+        for child in item.get("carousel_media") or []:
+            if isinstance(child, dict):
+                child_edges.append({"node": _node_from_feed_item(child, nested=True)})
+        if child_edges:
+            node["edge_sidecar_to_children"] = {"edges": child_edges}
+    return node
+
+
+def _edge_from_feed_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {"node": _node_from_feed_item(item)}
+
+
+def _collect_feed_v1_edges(
+    session,
+    use_curl: bool,
+    username: str,
+    user_id: str,
+    target_count: int,
+    seen_shortcodes: set[str],
+    csrf: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not user_id:
+        return [], {"pages_fetched": 0, "items_added": 0}
+
+    url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
+    headers = _api_headers(username, csrf)
+    headers["Referer"] = f"https://www.instagram.com/{username}/"
+
+    added: list[dict[str, Any]] = []
+    max_id: Optional[str] = None
+    pages_fetched = 0
+    stagnant_pages = 0
+
+    while len(seen_shortcodes) < target_count and pages_fetched < _FEED_V1_MAX_PAGES:
+        remaining = target_count - len(seen_shortcodes)
+        params: dict[str, Any] = {"count": min(_FEED_V1_PAGE_SIZE, max(remaining, 12))}
+        if max_id:
+            params["max_id"] = max_id
+
+        resp = _session_get(session, use_curl, url, headers)
+        pages_fetched += 1
+        if resp.status_code != 200:
+            break
+        try:
+            body = resp.json()
+        except json.JSONDecodeError:
+            break
+        if body.get("status") != "ok":
+            break
+
+        items = body.get("items") or []
+        if not isinstance(items, list) or not items:
+            stagnant_pages += 1
+            if stagnant_pages >= 2:
+                break
+        else:
+            stagnant_pages = 0
+            before = len(seen_shortcodes)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                sc = (item.get("code") or "").strip()
+                key = sc or str(item.get("pk") or item.get("id") or "").strip()
+                if key and key in seen_shortcodes:
+                    continue
+                if key:
+                    seen_shortcodes.add(key)
+                added.append(_edge_from_feed_item(item))
+                if len(seen_shortcodes) >= target_count:
+                    break
+            if len(seen_shortcodes) == before:
+                stagnant_pages += 1
+                if stagnant_pages >= 2:
+                    break
+
+        if not body.get("more_available"):
+            break
+        next_id = body.get("next_max_id")
+        if not next_id or str(next_id) == str(max_id or ""):
+            break
+        max_id = str(next_id)
+        time.sleep(0.55)
+
+    return added, {
+        "pages_fetched": pages_fetched,
+        "items_added": len(added),
+    }
 
 
 def _collect_timeline_edges(
@@ -422,6 +577,7 @@ def _collect_timeline_edges(
     timeline: Optional[dict[str, Any]],
     target_count: int,
     csrf: str,
+    posts_total: Optional[int] = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     page_info: dict[str, Any] = {}
@@ -431,8 +587,8 @@ def _collect_timeline_edges(
 
     edges = _dedupe_timeline_edges(edges)
     max_pages = max(
-        5,
-        (target_count + _TIMELINE_PAGE_SIZE - 1) // _TIMELINE_PAGE_SIZE + 5,
+        8,
+        (target_count + _TIMELINE_PAGE_SIZE - 1) // _TIMELINE_PAGE_SIZE + 8,
     )
     pages_fetched = 1
     last_cursor: Optional[str] = None
@@ -466,7 +622,7 @@ def _collect_timeline_edges(
         new_edges = next_page["edges"]
         if not new_edges:
             stagnant_pages += 1
-            if stagnant_pages >= 2:
+            if stagnant_pages >= 3:
                 break
             continue
         stagnant_pages = 0
@@ -476,7 +632,7 @@ def _collect_timeline_edges(
         edges = _dedupe_timeline_edges(edges)
         if len(edges) == before:
             stagnant_pages += 1
-            if stagnant_pages >= 2:
+            if stagnant_pages >= 3:
                 break
         else:
             stagnant_pages = 0
@@ -485,6 +641,24 @@ def _collect_timeline_edges(
         if not csrf:
             csrf = _csrf_token(session)
 
+    graphql_count = len(edges)
+    feed_v1_meta: dict[str, Any] = {"pages_fetched": 0, "items_added": 0}
+    account_has_more = posts_total is None or posts_total > graphql_count
+    if len(edges) < target_count and user_id and account_has_more:
+        seen = {_edge_shortcode(e) for e in edges if _edge_shortcode(e)}
+        feed_edges, feed_v1_meta = _collect_feed_v1_edges(
+            session,
+            use_curl,
+            username,
+            user_id,
+            target_count,
+            seen,
+            csrf,
+        )
+        if feed_edges:
+            edges.extend(feed_edges)
+            edges = _dedupe_timeline_edges(edges)
+
     order_corrected = False
     if not _timeline_order_ok(edges):
         edges = _sort_timeline_edges_newest_first(edges)
@@ -492,6 +666,9 @@ def _collect_timeline_edges(
 
     meta = {
         "pages_fetched": pages_fetched,
+        "graphql_edges": graphql_count,
+        "feed_v1_pages": feed_v1_meta.get("pages_fetched", 0),
+        "feed_v1_added": feed_v1_meta.get("items_added", 0),
         "edges_collected": len(edges),
         "order_corrected": order_corrected,
     }
@@ -880,6 +1057,8 @@ def scrape_instagram_profile(
     recent_posts: int = 0,
     include_highlights: bool = False,
     instagram_sessionid: Optional[str] = None,
+    use_system_proxy: bool = False,
+    proxy_url: Optional[str] = None,
 ):
     recent_posts = max(0, min(int(recent_posts or 0), _MAX_POSTS))
     username = (username or "").strip().lstrip("@")
@@ -892,7 +1071,11 @@ def scrape_instagram_profile(
     )
 
     sid = _instagram_sessionid(instagram_sessionid)
-    session, use_curl = _new_session(sid or None)
+    session, use_curl = _new_session(
+        sid or None,
+        use_system_proxy=use_system_proxy,
+        proxy_url=proxy_url,
+    )
     _session_get(session, use_curl, profile_url, _browser_headers())
     csrf = _csrf_token(session)
 
@@ -960,6 +1143,12 @@ def scrape_instagram_profile(
 
     profile["posts"] = []
 
+    posts_total = profile.get("posts_count")
+    if isinstance(posts_total, str) and posts_total.isdigit():
+        posts_total = int(posts_total)
+    elif not isinstance(posts_total, int):
+        posts_total = None
+
     edges, fetch_meta = _collect_timeline_edges(
         session,
         use_curl,
@@ -968,6 +1157,7 @@ def scrape_instagram_profile(
         timeline,
         recent_posts,
         csrf,
+        posts_total=posts_total,
     )
     profile["posts_fetch"] = fetch_meta
 
@@ -978,10 +1168,17 @@ def scrape_instagram_profile(
         return profile
 
     if recent_posts > len(edges):
-        profile["posts_note"] = (
-            f"Only {len(edges)} post(s) available (requested {recent_posts}). "
-            "Private accounts, rate limits, or API changes can limit results."
-        )
+        if posts_total is not None and len(edges) >= posts_total:
+            profile["posts_note"] = (
+                f"Profile has {posts_total} post(s); returned all {len(edges)} "
+                f"(requested {recent_posts})."
+            )
+        else:
+            profile["posts_note"] = (
+                f"Only {len(edges)} post(s) available (requested {recent_posts}). "
+                "Try adding an Instagram sessionid for private accounts or deeper history. "
+                "Rate limits and API changes can also limit results."
+            )
 
     for pos, edge in enumerate(edges[:recent_posts], start=1):
         node = edge.get("node") if isinstance(edge, dict) else None

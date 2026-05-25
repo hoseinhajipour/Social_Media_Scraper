@@ -39,6 +39,16 @@ def main():
         default="",
         help="Instagram sessionid cookie (or set INSTAGRAM_SESSIONID) for highlight media",
     )
+    parser.add_argument(
+        "--use-system-proxy",
+        action="store_true",
+        help="Use system proxy settings for Instagram requests.",
+    )
+    parser.add_argument(
+        "--proxy-url",
+        default="",
+        help="Optional proxy URL to use for Instagram requests.",
+    )
 
     args = parser.parse_args()
     platform = args.platform
@@ -54,6 +64,8 @@ def main():
                 recent_posts=args.recent_posts,
                 include_highlights=args.highlights,
                 instagram_sessionid=args.instagram_sessionid or None,
+                use_system_proxy=args.use_system_proxy,
+                proxy_url=args.proxy_url or None,
             )
         else:
             if args.recent_posts or args.highlights:

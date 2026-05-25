@@ -56,6 +56,23 @@ with tab_scrape:
             ),
             key="scrape_instagram_sessionid",
         )
+        use_system_proxy = st.checkbox(
+            "Use system proxy",
+            value=False,
+            key="scrape_use_system_proxy",
+            help=(
+                "If checked, the scraper uses the system proxy settings for Instagram requests. "
+                "If the proxy is not available via env vars, enter it below."
+            ),
+        )
+        proxy_url = st.text_input(
+            "Proxy URL (optional)",
+            value="",
+            help=(
+                "Enter a proxy URL if needed, e.g. http://127.0.0.1:1080 or socks5h://127.0.0.1:1080."
+            ),
+            key="scrape_proxy_url",
+        )
 
     if st.button("Scrape"):
         if username:
@@ -67,6 +84,8 @@ with tab_scrape:
                         recent_posts=recent_posts_n,
                         include_highlights=include_highlights,
                         instagram_sessionid=instagram_sessionid or None,
+                        use_system_proxy=use_system_proxy,
+                        proxy_url=proxy_url or None,
                     )
                 else:
                     data = SCRAPER_MAP[platform](username)
@@ -136,6 +155,8 @@ with tab_scrape:
                         progress_callback=_cb,
                         resume=resume_dl,
                         download_highlights=download_highlights,
+                        use_system_proxy=use_system_proxy,
+                        proxy_url=proxy_url or None,
                     )
                     prog.progress(1.0)
                     pct.markdown("**100%** — done")
@@ -210,6 +231,22 @@ with tab_resume:
             value=True,
             key="resume_tab_resume",
         )
+        use_system_proxy_resume = st.checkbox(
+            "Use system proxy",
+            value=False,
+            key="resume_use_system_proxy",
+            help=(
+                "If checked, the resume downloader uses the system proxy settings for Instagram media requests."
+            ),
+        )
+        proxy_url_resume = st.text_input(
+            "Proxy URL (optional)",
+            value="",
+            help=(
+                "Enter a proxy URL if needed, e.g. http://127.0.0.1:1080 or socks5h://127.0.0.1:1080."
+            ),
+            key="resume_proxy_url",
+        )
 
         if (
             st.button("Start download", key="resume_start_download")
@@ -236,6 +273,8 @@ with tab_resume:
                     progress_callback=_cb2,
                     resume=resume_resume,
                     download_highlights=download_highlights_resume,
+                    use_system_proxy=use_system_proxy_resume,
+                    proxy_url=proxy_url_resume or None,
                 )
                 prog2.progress(1.0)
                 pct2.markdown("**100%** — done")
